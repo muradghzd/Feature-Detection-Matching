@@ -1,6 +1,17 @@
 import cv2
 import numpy as np
-from numpy import linalg.norm as LA
+import skimage
+
+# Global variables (tuned)
+alpha = 0.06
+sobel_v = np.array([[1,0,-1],[2,0,-2],[1,0,-1]])
+sobel_h = np.array([[1,2,1],[0,0,0],[-1,-2,-1]])
+args1 = [(0,0), 0.15]
+args2 = [(0, 0), 0.167]
+args3 = [(0,0), 0.295]
+threshold1 = 0.04
+threshold2 = 0.15
+threshold3 = 0.9
 
 def get_interest_points(image, descriptor_window_image_width):
     # Local Feature Stencil Code
@@ -24,10 +35,36 @@ def get_interest_points(image, descriptor_window_image_width):
     # it is safe to simply suppress the gradients / corners near the edges of
     # the image.
 
-    # Placeholder that you can delete -- random points
-    x = np.floor(np.random.rand(500) * np.float32(image.shape[1]))
-    y = np.floor(np.random.rand(500) * np.float32(image.shape[0]))
-    return x,y
+    # My implementation
+    m, n = image.shape
+    C = np.zeros((m, n))    
+    w = descriptor_window_image_width//2
+    image = cv2.GaussianBlur(image, *args1)
+ 
+    I_x = cv2.filter2D(image, -1, kernel=sobel_v)
+    I_y = cv2.filter2D(image, -1, kernel=sobel_h)
+
+    I_xx = I_x*I_x
+    I_xy = I_x*I_y
+    I_yy = I_y*I_y
+    
+    I_xx = cv2.GaussianBlur(I_xx, *args1) 
+    I_yy = cv2.GaussianBlur(I_yy, *args1)
+    I_xy = cv2.GaussianBlur(I_xy, *args1)
+
+    for i in range(w, m-w+1):
+        for j in range(w, n-w+1):
+            g_XX = np.sum(I_xx[i-w:i+w,j-w:j+w])
+            g_YY = np.sum(I_yy[i-w:i+w,j-w:j+w])
+            g_XY = np.sum(I_xy[i-w:i+w,j-w:j+w])
+
+            c = g_XX*g_YY-g_XY*g_XY-alpha*(g_XX+g_YY)*(g_XX+g_YY)
+            if c > threshold1:
+                C[i,j] = c
+
+    y, x = skimage.feature.peak_local_max(C, 3, threshold1).T
+
+    return x, y
 
     # After computing interest points, here's roughly how many we return
     # For each of the three image pairs
@@ -56,9 +93,43 @@ def get_descriptors(image, x, y, descriptor_window_image_width):
     #   following size: [length(x) x feature dimensionality] (e.g. 128 for
     #   standard SIFT)
 
+    # My implementation
+    a, b = image.shape[:2]
+    m = x.size
+    w_h = descriptor_window_image_width//2
+    w_q = descriptor_window_image_width//4
 
-    # Placeholder that you can delete. Empty features.
-    features = np.zeros((x.shape[0], 128))
+    features = np.zeros((m, w_q, w_q, 8))
+    image = cv2.GaussianBlur(image, *args2)
+    
+    i_x = cv2.filter2D(image,-1,kernel=sobel_v)
+    i_y = cv2.filter2D(image, -1,kernel=sobel_h)
+    
+    dir_grad = np.arctan2(i_y, i_x)
+    dir_grad = np.where(dir_grad>=0,dir_grad,dir_grad+2*np.pi)
+    mag_grad = np.sqrt(i_x**2 + i_y**2)
+    
+    for i in range(m):
+        # Suppresing border values
+        y_i = min(max(int(y[i]), w_h), a-w_h)
+        x_i = min(max(int(x[i]), w_h), b-w_h) 
+
+        mag_w = cv2.GaussianBlur(mag_grad[y_i-w_h:y_i+w_h, x_i-w_h:x_i+w_h], *args3)
+        dir_w = cv2.GaussianBlur(dir_grad[y_i-w_h:y_i+w_h, x_i-w_h:x_i+w_h], *args3)
+
+        features = do_bin(features,mag_w,dir_w,descriptor_window_image_width,i)
+
+
+    features = np.reshape(features, (m, -1))
+    
+    features_sq = np.linalg.norm(features, axis=1)
+    features = features / np.reshape(features_sq, (-1, 1))
+    
+    features = np.where(features<threshold2, features, threshold2)
+    
+    features_sq = np.linalg.norm(features, axis=1)
+    features = features / np.reshape(features_sq, (-1, 1)) 
+
     return features
 
 def match_features(features1, features2):
@@ -84,11 +155,34 @@ def match_features(features1, features2):
     #
     # 'confidences' is a k x 1 matrix with a real valued confidence for every match.
 
-    # Placeholder random matches and confidences.
-    num_features = min(features1.shape[0], features2.shape[0])
-    matches = np.zeros((num_features, 2))
-    matches[:,0] = np.random.permutation(num_features)
-    matches[:,1] = np.random.permutation(num_features)
-    confidences = np.random.rand(num_features)
+    # My implementation
+    m, n = features1.shape[0], features2.shape[0]
+
+    matches = []
+    confidences = []
+    for i in range(m):
+        f1 = features1[i]
+        diff = features2 - f1
+        norm_diff = np.linalg.norm(diff, axis=1)
+        nearest_two = np.argsort(norm_diff)
+        ratio = norm_diff[nearest_two[0]] / norm_diff[nearest_two[1]]
+        if ratio < threshold3:
+            matches.append([i, nearest_two[0]])
+            confidences.append(1-ratio)
+    matches = np.array(matches)
+    confidences = np.array(confidences)
+
     return matches, confidences
 
+# Helper function(s)
+def do_bin(fs, mag_w, dir_w, width,i):
+    w_q = width//4
+    for x in range(w_q):
+        for y in range(w_q):
+            mag_xy = mag_w[x*w_q: (x+1)*w_q, y*w_q:(y+1)*w_q]
+
+            dir_xy = dir_w[x*w_q: (x+1)*w_q, y*w_q:(y+1)*w_q]
+
+            fs[i, x, y] = np.histogram(dir_xy, bins=8, range=(0, 2*np.pi), weights=mag_xy)[0]
+
+    return fs
